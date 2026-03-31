@@ -161,13 +161,32 @@ def build_image_splits(root, seed=42):
     all_s = (collect_anatomy_samples(root) + collect_polyp_samples(root, bbox_data) +
              collect_uc_samples(root) + collect_normal_samples(root))
     print(f"[INFO] Total samples: {len(all_s)}")
-    keys = [f"anatomy_{s['anatomy_label']}" if s["anatomy_label"]>=0 else s["source"] for s in all_s]
+    
+    # 🔥 FIX #1: Stratify by both anatomy AND UC grade for balanced splits
+    # This ensures all UC grades are equally represented in train/val/test
+    keys = []
+    for s in all_s:
+        if s["anatomy_label"] >= 0:
+            key = f"anatomy_{s['anatomy_label']}"
+        elif s["uc_grade"] >= 0:
+            key = f"uc_grade_{s['uc_grade']}"
+        else:
+            key = s["source"]
+        keys.append(key)
+    
     idx  = list(range(len(all_s)))
+    
+    # First split: 85% train+val, 15% test (stratified by UC grade + anatomy)
     iv, it = train_test_split(idx, test_size=0.15, stratify=keys, random_state=seed)
-    kv     = [keys[i] for i in iv]
+    
+    # Second split: 70/30 → 70% train, 30% becomes val initially, then 15% test
+    # From the 85%, we take 15/85 ≈ 17.65% as val
+    kv = [keys[i] for i in iv]
     itr, iv2 = train_test_split(iv, test_size=0.176, stratify=kv, random_state=seed)
+    
     tr, va, te = [all_s[i] for i in itr], [all_s[i] for i in iv2], [all_s[i] for i in it]
     print(f"[INFO] Train:{len(tr)}  Val:{len(va)}  Test:{len(te)}")
+    print(f"[INFO] ✓ Stratified split by anatomy + UC grade for balanced distribution")
     return tr, va, te
 
 # ─── Datasets ─────────────────────────────────────────────────────────────────

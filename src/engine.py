@@ -20,13 +20,20 @@ def set_seed(seed=42):
 
 # ─── Loss ─────────────────────────────────────────────────────────────────────
 class ACDNetLoss(nn.Module):
-    def __init__(self, lam_det=1.0, lam_seg=0.5, lam_sev=1.0, lam_temp=0.1, pos_weight=3.0):
+    def __init__(self, lam_det=1.0, lam_seg=0.5, lam_sev=1.0, lam_temp=0.1, pos_weight=3.0, sev_class_weights=None):
         super().__init__()
         self.lam_det, self.lam_seg = lam_det, lam_seg
         self.lam_sev, self.lam_temp = lam_sev, lam_temp
         self.bce_det = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
         self.bce_seg = nn.BCEWithLogitsLoss()
-        self.ce_sev  = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        # 🔥 FIX #7: Add class weights for severity (inverse frequency weighting)
+        if sev_class_weights is None:
+            # Default: inverse frequency weighting for UC grades [G0-1, G1, G2, G3]
+            # Assumes approximate distribution: G0-1(5%), G1(25%), G2(50%), G3(20%)
+            sev_class_weights = torch.tensor([2.0, 1.2, 0.8, 1.1], dtype=torch.float32)
+        
+        self.ce_sev = nn.CrossEntropyLoss(weight=sev_class_weights, label_smoothing=0.1)
 
     def detection_loss(self, logit, label):
         v = label >= 0
@@ -45,6 +52,9 @@ class ACDNetLoss(nn.Module):
     def severity_loss(self, logit, grade):
         v = grade >= 0
         if v.sum() == 0: return torch.tensor(0., device=logit.device, requires_grad=True)
+        # 🔥 Move class weights to same device as logit
+        if self.ce_sev.weight is not None:
+            self.ce_sev.weight = self.ce_sev.weight.to(logit.device)
         return self.ce_sev(logit[v], grade[v])
 
     def temporal_loss(self, sev_seq):
