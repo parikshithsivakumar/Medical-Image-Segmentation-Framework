@@ -19,8 +19,8 @@ BACKBONE_CHANNELS = 1280   # EfficientNet-B0 final feature channels
 # ─── Stage 2: Anatomy branch CNN ──────────────────────────────────────────────
 
 class AnatomyCNN(nn.Module):
-    """3-layer CNN → 64-dim location embedding + 3-class logits."""
-    def __init__(self, num_classes: int = 3, embedding_dim: int = 64):
+    """3-layer CNN → 64-dim location embedding + 2-class logits (cecum vs other)."""
+    def __init__(self, num_classes: int = 2, embedding_dim: int = 64):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.conv1 = nn.Sequential(
@@ -35,7 +35,8 @@ class AnatomyCNN(nn.Module):
         self.embedding_layer = nn.Sequential(
             nn.Flatten(),
             nn.Linear(128 * 4 * 4, 256), nn.ReLU(inplace=True),
-            nn.Dropout(p=0.3),
+            # 🔥 FIX #4: Increased dropout to 0.4 to reduce overfitting
+            nn.Dropout(p=0.4),
             nn.Linear(256, embedding_dim), nn.ReLU(inplace=True))
         self.classifier = nn.Linear(embedding_dim, num_classes)
 
@@ -154,7 +155,7 @@ class SegmentationHead(nn.Module):
 # ─── Full ACDNet ──────────────────────────────────────────────────────────────
 
 class ACDNet(nn.Module):
-    def __init__(self, anatomy_cnn, num_uc_grades=4,
+    def __init__(self, anatomy_cnn, num_uc_grades=3,  # 🔥 FIX #2: Changed from 4 to 3
                  embedding_dim=64, dropout_p=0.3, pretrained=True):
         super().__init__()
         self.anatomy_cnn = anatomy_cnn
@@ -201,9 +202,9 @@ class ACDNet(nn.Module):
                 "bbox": bbox, "severity_logit": sev_logit, "features": features}
 
 
-def build_acdnet(anatomy_checkpoint, num_uc_grades=4,
+def build_acdnet(anatomy_checkpoint, num_uc_grades=3,  # 🔥 FIX #2: Changed from 4 to 3
                  embedding_dim=64, dropout_p=0.3, pretrained_backbone=True):
-    anatomy_cnn = build_anatomy_cnn(3, embedding_dim, anatomy_checkpoint)
+    anatomy_cnn = build_anatomy_cnn(2, embedding_dim, anatomy_checkpoint)  # 🔥 FIX #5: Changed from 3 to 2 classes
     freeze_anatomy_cnn(anatomy_cnn)
     return ACDNet(anatomy_cnn, num_uc_grades, embedding_dim,
                   dropout_p, pretrained_backbone)

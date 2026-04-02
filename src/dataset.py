@@ -11,26 +11,33 @@ from albumentations.pytorch import ToTensorV2
 import torch
 
 # ─── Label maps ───────────────────────────────────────────────────────────────
-ANATOMY_CLASSES   = {"cecum": 0, "ileum": 1, "retroflex-rectum": 2}
+ANATOMY_CLASSES   = {"cecum": 0, "other": 1}  # 🔥 FIX #5: Merged ileum + retroflex → 2-class
 ANATOMY_IDX2NAME  = {v: k for k, v in ANATOMY_CLASSES.items()}
+# 🔥 FIX #2: Merge G0-1 and G1 to handle class imbalance (only 5 G0-1 test samples)
 UC_GRADE_MAP = {
-    "ulcerative-colitis-grade-0-1": 0, "ulcerative-colitis-grade-1":   1,
-    "ulcerative-colitis-grade-1-2": 1, "ulcerative-colitis-grade-2":   2,
-    "ulcerative-colitis-grade-2-3": 2, "ulcerative-colitis-grade-3":   3,
+    "ulcerative-colitis-grade-0-1": 0, "ulcerative-colitis-grade-1":   0,  # Merge to 0
+    "ulcerative-colitis-grade-1-2": 0, "ulcerative-colitis-grade-2":   1,  # G2 → 1
+    "ulcerative-colitis-grade-2-3": 1, "ulcerative-colitis-grade-3":   2,  # G3 → 2
 }
-UC_IDX2NAME          = {0: "grade 0-1", 1: "grade 1", 2: "grade 2", 3: "grade 3"}
-NUM_ANATOMY_CLASSES  = 3
-NUM_UC_GRADES        = 4
+UC_IDX2NAME          = {0: "grade 0-1", 1: "grade 2", 2: "grade 3"}  # 3-class now
+NUM_ANATOMY_CLASSES  = 2  # 🔥 FIX #5: Changed from 3 to 2 classes (cecum vs other)
+NUM_UC_GRADES        = 3  # 🔥 FIX #2: Changed from 4 to 3 (merged G0-1+G1)
 
 # ─── Transforms ───────────────────────────────────────────────────────────────
 def get_transforms(split, image_size=224):
     if split == "train":
+        # 🔥 FIX #4: Enhanced augmentation to reduce overfitting
         return A.Compose([
             A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.3),
             A.RandomRotate90(p=0.3),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, p=0.5),
-            A.GaussNoise(p=0.3),
+            # Stronger color jittering
+            A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, p=0.6),
+            # Gaussian blur for robustness
+            A.GaussianBlur(blur_limit=3, p=0.4),
+            A.GaussNoise(var_limit=(10, 50), p=0.3),
+            # Elastic deformation for colonoscopy
+            A.ElasticTransform(alpha=1, sigma=50, alpha_affine=50, p=0.2),
             A.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
             ToTensorV2()], additional_targets={"mask": "mask"})
     return A.Compose([
@@ -41,11 +48,14 @@ def get_transforms(split, image_size=224):
 # ─── Sample collectors ─────────────────────────────────────────────────────────
 def collect_anatomy_samples(root):
     samples, base = [], Path(root)/"labeled-images"/"lower-gi-tract"/"anatomical-landmarks"
-    for name, idx in ANATOMY_CLASSES.items():
-        folder = base / name
-        if not folder.exists(): print(f"[WARN] {folder}"); continue
+    # 🔥 FIX #5: Map ileum + retroflex → label 1 ("other"), keep cecum → label 0
+    for folder_name in ["cecum", "ileum", "retroflex-rectum"]:
+        folder = base / folder_name
+        if not folder.exists(): continue
+        # Map: cecum → 0, ileum → 1, retroflex-rectum → 1
+        label = 0 if folder_name == "cecum" else 1
         for p in folder.glob("*.jpg"):
-            samples.append({"image_path": str(p), "anatomy_label": idx,
+            samples.append({"image_path": str(p), "anatomy_label": label,
                             "polyp_label": -1, "uc_grade": -1,
                             "mask_path": None, "source": "anatomy"})
     return samples
@@ -162,31 +172,98 @@ def build_image_splits(root, seed=42):
              collect_uc_samples(root) + collect_normal_samples(root))
     print(f"[INFO] Total samples: {len(all_s)}")
     
-    # 🔥 FIX #1: Stratify by both anatomy AND UC grade for balanced splits
-    # This ensures all UC grades are equally represented in train/val/test
-    keys = []
+    # 🔥 FIX #1: VIDEO-LEVEL SPLIT to prevent data leakage
+    # Problem: Individual frames from same video appearing in train+test → data leakage
+    # Solution: Group frames by video clip FIRST, then split groups
+    print("[INFO] Grouping samples by video clip to prevent data leakage...")
+    
+    video_groups = {}  # {video_id: [samples from this video]}
+    other_samples = []  # anatomy/normal samples (no video grouping)
+    
     for s in all_s:
-        if s["anatomy_label"] >= 0:
-            key = f"anatomy_{s['anatomy_label']}"
-        elif s["uc_grade"] >= 0:
-            key = f"uc_grade_{s['uc_grade']}"
+        # Try to extract video ID from image path
+        img_path = Path(s["image_path"])
+        # HyperKvasir structure: segmented-images/images/XXX_123.jpg
+        # or: labeled-images/.../polyps/YYYY_456.jpg
+        video_id = img_path.stem.rsplit('_', 1)[0] if '_' in img_path.stem else None
+        
+        if video_id and len(video_id) > 0:
+            if video_id not in video_groups:
+                video_groups[video_id] = []
+            video_groups[video_id].append(s)
+        else:
+            # Anatomy/normal images without clear video grouping
+            other_samples.append(s)
+    
+    # Split video groups using stratification
+    video_list = list(video_groups.values())
+    video_keys = []
+    for v_samples in video_list:
+        # Get label from first sample (all in group are same video)
+        s = v_samples[0]
+        if s["uc_grade"] >= 0:
+            key = f"uc_{s['uc_grade']}"
+        elif s["anatomy_label"] >= 0:
+            key = f"anat_{s['anatomy_label']}"
         else:
             key = s["source"]
-        keys.append(key)
+        video_keys.append(key)
     
-    idx  = list(range(len(all_s)))
+    # Split: 15% test, 85% train+val
+    if len(video_list) > 1:
+        v_tv, v_test_idx = train_test_split(
+            range(len(video_list)), test_size=0.15, stratify=video_keys, random_state=seed)
+    else:
+        v_tv, v_test_idx = list(range(len(video_list))), []
     
-    # First split: 85% train+val, 15% test (stratified by UC grade + anatomy)
-    iv, it = train_test_split(idx, test_size=0.15, stratify=keys, random_state=seed)
+    # Split train+val: 70% train, 30% val (from the 85%)
+    if len(v_tv) > 1:
+        v_train_keys = [video_keys[i] for i in v_tv]
+        v_train_idx, v_val_idx = train_test_split(
+            v_tv, test_size=0.176, stratify=v_train_keys, random_state=seed)
+    else:
+        v_train_idx, v_val_idx = v_tv, []
     
-    # Second split: 70/30 → 70% train, 30% becomes val initially, then 15% test
-    # From the 85%, we take 15/85 ≈ 17.65% as val
-    kv = [keys[i] for i in iv]
-    itr, iv2 = train_test_split(iv, test_size=0.176, stratify=kv, random_state=seed)
+    # Flatten: video groups → frame samples
+    train_videos = [f for i in v_train_idx for f in video_list[i]]
+    val_videos = [f for i in v_val_idx for f in video_list[i]]
+    test_videos = [f for i in v_test_idx for f in video_list[i]]
     
-    tr, va, te = [all_s[i] for i in itr], [all_s[i] for i in iv2], [all_s[i] for i in it]
+    # Also split other (non-grouped) samples
+    if other_samples:
+        other_keys = []
+        for s in other_samples:
+            if s["uc_grade"] >= 0:
+                key = f"uc_{s['uc_grade']}"
+            elif s["anatomy_label"] >= 0:
+                key = f"anat_{s['anatomy_label']}"
+            else:
+                key = s["source"]
+            other_keys.append(key)
+        
+        if len(other_samples) > 1:
+            other_tv, other_test_idx = train_test_split(
+                range(len(other_samples)), test_size=0.15, stratify=other_keys, random_state=seed)
+            other_keys_tv = [other_keys[i] for i in other_tv]
+            other_train_idx, other_val_idx = train_test_split(
+                other_tv, test_size=0.176, stratify=other_keys_tv, random_state=seed)
+        else:
+            other_train_idx, other_val_idx, other_test_idx = other_samples, [], []
+        
+        train_other = [other_samples[i] for i in other_train_idx]
+        val_other = [other_samples[i] for i in other_val_idx]
+        test_other = [other_samples[i] for i in other_test_idx]
+    else:
+        train_other, val_other, test_other = [], [], []
+    
+    # Combine video groups + other samples
+    tr = train_videos + train_other
+    va = val_videos + val_other
+    te = test_videos + test_other
+    
+    print(f"[INFO] Video-level split: {len(video_groups)} video groups")
     print(f"[INFO] Train:{len(tr)}  Val:{len(va)}  Test:{len(te)}")
-    print(f"[INFO] ✓ Stratified split by anatomy + UC grade for balanced distribution")
+    print(f"[INFO] ✓ FIX #1: Video-level split prevents frame leakage across train/test")
     return tr, va, te
 
 # ─── Datasets ─────────────────────────────────────────────────────────────────
